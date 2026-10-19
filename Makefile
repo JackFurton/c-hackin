@@ -8,7 +8,7 @@ HDR := $(wildcard src/*.h)
 
 build/pry: $(SRC) $(HDR)
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(SAN) -o $@ $(SRC)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(SAN) -o $@ $(SRC)
 
 release: SAN :=
 release: CFLAGS := -std=gnu11 -O2
@@ -29,14 +29,17 @@ LIB_SRC := $(filter-out src/main.c,$(SRC))
 
 build/fuzz_macho: fuzz/fuzz_macho.c $(LIB_SRC) $(HDR)
 	@mkdir -p build
-	$(FUZZ_CC) -std=gnu11 -g -O1 -fsanitize=fuzzer,address,undefined -o $@ fuzz/fuzz_macho.c $(LIB_SRC)
+	$(FUZZ_CC) -std=gnu11 -g -O1 $(EXTRA_CFLAGS) -fsanitize=fuzzer,address,undefined -o $@ fuzz/fuzz_macho.c $(LIB_SRC)
 
 fuzz: build/fuzz_macho samples
 	@mkdir -p build/corpus
 	cp build/samples/crackme0 build/samples/crackme0.stripped build/corpus/
 	build/fuzz_macho -max_total_time=$${FUZZ_SECONDS:-60} build/corpus
 
+test: build/pry samples
+	tests/smoke.sh
+
 clean:
 	rm -rf build
 
-.PHONY: release samples fuzz clean
+.PHONY: release samples fuzz test clean

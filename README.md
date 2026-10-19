@@ -1,5 +1,7 @@
 # pry
 
+[![CI](https://github.com/JackFurton/c-hackin/actions/workflows/ci.yml/badge.svg)](https://github.com/JackFurton/c-hackin/actions/workflows/ci.yml)
+
 A binary analysis tool written from scratch in C: loaders, disassemblers and
 analysis passes, no libbfd/capstone/LIEF. Mach-O on arm64 first, since that's
 what this machine runs.
@@ -8,6 +10,8 @@ what this machine runs.
 make            # debug build with ASan/UBSan
 make release    # optimized, no sanitizers
 make samples    # crackme targets in build/samples
+make test       # smoke tests against nm/otool (macOS)
+make fuzz       # libFuzzer, needs brew llvm; FUZZ_SECONDS=600 for longer
 ```
 
 ```

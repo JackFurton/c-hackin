@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS build + smoke tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (ASan/UBSan, -Werror)
+        run: make EXTRA_CFLAGS=-Werror
+      - name: Smoke tests against nm/otool
+        run: make test
+
+  fuzz:
+    name: Fuzz Mach-O parser
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM (Apple clang has no libFuzzer)
+        run: brew list llvm >/dev/null 2>&1 || brew install llvm
+      - name: Fuzz for 2 minutes
+        run: FUZZ_SECONDS=120 make fuzz EXTRA_CFLAGS=-Werror
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+          if-no-files-found: ignore
+
+  linux:
+    name: Linux build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pry and fuzzer with clang
+        run: make build/pry build/fuzz_macho CC=clang FUZZ_CC=clang EXTRA_CFLAGS=-Werror
+      - name: Rejects an ELF cleanly
+        run: build/pry info build/pry 2>&1 | grep -q 'not a Mach-O'
