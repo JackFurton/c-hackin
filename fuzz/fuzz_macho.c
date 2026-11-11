@@ -1,11 +1,19 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "../src/arm64.h"
 #include "../src/macho.h"
 
 /* Exercise every query a command can make, since those read through parsed offsets. */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+    /* The decoder sees every word directly, whether or not the input parses. */
+    arm64_insn in;
+    for (size_t i = 0; i + 4 <= size; i += 4)
+        arm64_decode((uint32_t)data[i] | (uint32_t)data[i + 1] << 8 | (uint32_t)data[i + 2] << 16 |
+                         (uint32_t)data[i + 3] << 24,
+                     i, &in);
+
     macho m;
     if (macho_open_mem(&m, data, size, NULL) < 0)
         return 0;

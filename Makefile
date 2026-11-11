@@ -39,7 +39,11 @@ fuzz: build/fuzz_macho samples
 test: build/pry samples
 	tests/smoke.sh
 
+# Random instruction words diffed against llvm-objdump. Needs brew llvm.
+difftest: build/pry samples
+	tests/difftest.sh $${DIFF_WORDS:-200000} $${DIFF_SEED:-1}
+
 clean:
 	rm -rf build
 
-.PHONY: release samples fuzz test clean
+.PHONY: release samples fuzz test difftest clean
