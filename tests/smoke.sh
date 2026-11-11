@@ -32,6 +32,10 @@ check "funcs survive strip" diff <(addrs $S) <(addrs $S.stripped)
 check "stripped funcs are unnamed" grep -q '2 functions, 2 without a symbol' <("$PRY" funcs $S.stripped)
 check "strings finds literals" grep -q '"access granted"' <("$PRY" strings $S)
 check "hex resolves symbols" grep -qE '^[0-9a-f]{16}  ' <("$PRY" hex $S _main 16)
+check "disasm resolves calls to symbols" grep -qE 'bl +0x[0-9a-f]+ <_check>$' <("$PRY" disasm $S _main)
+check "disasm stops at the function's end" grep -qE ' ret$' <("$PRY" disasm $S _check | tail -1)
+check "stripped disasm labels sub_" grep -qE '^sub_[0-9a-f]+:$' <("$PRY" disasm $S.stripped)
+check "disasm refuses x86_64" bash -c "! '$PRY' -a x86_64 disasm /bin/ls 2>/dev/null"
 check "fat file picks requested slice" grep -qE '^arch +x86_64$' <("$PRY" -a x86_64 info /bin/ls)
 check "missing slice is an error" bash -c "! '$PRY' -a i386 info /bin/ls"
 check "non-Mach-O is rejected" bash -c "'$PRY' info Makefile 2>&1 | grep -q 'not a Mach-O'"

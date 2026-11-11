@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "arm64.h"
 #include "macho.h"
 
 static const char *basename_of(const char *p)
@@ -518,50 +519,58 @@ static void hexdump(const uint8_t *p, uint64_t len, uint64_t addr)
     }
 }
 
-static int cmd_hex(const macho *m, int argc, char **argv)
+/* Resolves "addr", "symbol" or "seg,sect". *sect_size is the section's size for
+   seg,sect and 0 otherwise, so callers can default to "the whole thing". */
+static int parse_target(const macho *m, const char *t, uint64_t *addr, uint64_t *sect_size)
 {
-    if (argc < 1) {
-        fprintf(stderr, "usage: pry hex <file> <addr | symbol | seg,sect> [len]\n");
-        return 2;
-    }
-    const char *t = argv[0];
-    uint64_t addr, len = 128;
-    int have_len = argc > 1;
-    if (have_len)
-        len = strtoull(argv[1], NULL, 0);
-
+    *sect_size = 0;
     const char *comma = strchr(t, ',');
     if (comma) {
         char seg[17] = {0};
         size_t sl = (size_t)(comma - t);
         if (sl > 16) {
             fprintf(stderr, "pry: segment name too long\n");
-            return 1;
+            return -1;
         }
         memcpy(seg, t, sl);
         const struct section_64 *s = macho_section_named(m, seg, comma + 1);
         if (!s) {
             fprintf(stderr, "pry: no section %s\n", t);
-            return 1;
+            return -1;
         }
-        addr = s->addr;
-        if (!have_len)
-            len = s->size;
+        *addr = s->addr;
+        *sect_size = s->size;
     } else if (isdigit((unsigned char)t[0])) {
         char *end;
-        addr = strtoull(t, &end, 0);
+        *addr = strtoull(t, &end, 0);
         if (*end) {
             fprintf(stderr, "pry: bad address %s\n", t);
-            return 1;
+            return -1;
         }
     } else {
         const macho_sym *s = macho_sym_named(m, t);
         if (!s || (s->type & N_TYPE) != N_SECT) {
             fprintf(stderr, "pry: no defined symbol %s\n", t);
-            return 1;
+            return -1;
         }
-        addr = s->addr;
+        *addr = s->addr;
     }
+    return 0;
+}
+
+static int cmd_hex(const macho *m, int argc, char **argv)
+{
+    if (argc < 1) {
+        fprintf(stderr, "usage: pry hex <file> <addr | symbol | seg,sect> [len]\n");
+        return 2;
+    }
+    uint64_t addr, len;
+    if (parse_target(m, argv[0], &addr, &len) < 0)
+        return 1;
+    if (argc > 1)
+        len = strtoull(argv[1], NULL, 0);
+    else if (!len)
+        len = 128;
 
     uint64_t avail;
     const uint8_t *p = macho_vm_bytes(m, addr, &avail);
@@ -573,6 +582,183 @@ static int cmd_hex(const macho *m, int argc, char **argv)
         len = avail;
     hexdump(p, len, addr);
     return 0;
+}
+
+/* Every address worth a name: defined symbols, plus function starts that lost
+   theirs to strip (sym == NULL, printed as sub_<addr>). Sorted, one per address. */
+typedef struct {
+    uint64_t         addr;
+    const macho_sym *sym;
+} label;
+
+typedef struct {
+    label *v;
+    size_t n;
+} labels;
+
+static int label_cmp(const void *a, const void *b)
+{
+    const label *x = a, *y = b;
+    if (x->addr != y->addr)
+        return x->addr < y->addr ? -1 : 1;
+    return (y->sym != NULL) - (x->sym != NULL);
+}
+
+static labels build_labels(const macho *m)
+{
+    uint64_t *starts = NULL;
+    size_t nstarts = 0;
+    if (macho_function_starts(m, &starts, &nstarts) < 0)
+        nstarts = 0;
+
+    labels L = {malloc((m->nsorted + nstarts + 1) * sizeof(label)), 0};
+    if (!L.v) {
+        free(starts);
+        return L;
+    }
+    for (size_t i = 0; i < m->nsorted; i++)
+        if ((m->syms[i].type & N_TYPE) == N_SECT)
+            L.v[L.n++] = (label){m->syms[i].addr, macho_sym_at(m, m->syms[i].addr)};
+    for (size_t i = 0; i < nstarts; i++)
+        L.v[L.n++] = (label){starts[i], NULL};
+    free(starts);
+
+    qsort(L.v, L.n, sizeof(label), label_cmp);
+    size_t out = 0;
+    for (size_t i = 0; i < L.n; i++)
+        if (!out || L.v[out - 1].addr != L.v[i].addr)
+            L.v[out++] = L.v[i];
+    L.n = out;
+    return L;
+}
+
+/* The last label at or before addr, or NULL. */
+static const label *label_before(const labels *L, uint64_t addr)
+{
+    size_t lo = 0, hi = L->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (L->v[mid].addr <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo ? &L->v[lo - 1] : NULL;
+}
+
+static void print_label_name(const label *l)
+{
+    if (l->sym)
+        fputs(l->sym->name, stdout);
+    else
+        printf("sub_%" PRIx64, l->addr);
+}
+
+/* " <_main+0x50>", or " <__stubs+0xc>" when nothing in that section has a name. */
+static void print_symbolic(const macho *m, const labels *L, uint64_t addr)
+{
+    const struct section_64 *sec = macho_section_at_vm(m, addr);
+    if (!sec)
+        return;
+    const label *l = label_before(L, addr);
+    fputs(" <", stdout);
+    if (l && l->addr >= sec->addr) {
+        print_label_name(l);
+        if (addr != l->addr)
+            printf("+0x%" PRIx64, addr - l->addr);
+    } else {
+        printf("%.16s", sec->sectname);
+        if (addr != sec->addr)
+            printf("+0x%" PRIx64, addr - sec->addr);
+    }
+    putchar('>');
+}
+
+static void disasm(const macho *m, const labels *L, uint64_t addr, uint64_t end, uint64_t count)
+{
+    uint64_t avail;
+    const uint8_t *p = macho_vm_bytes(m, addr, &avail);
+    if (!p) {
+        printf("0x%" PRIx64 " has no file bytes\n", addr);
+        return;
+    }
+    if (end - addr > avail)
+        end = addr + avail;
+
+    for (uint64_t n = 0; n < count && end - addr >= 4; n++, addr += 4, p += 4) {
+        const label *l = label_before(L, addr);
+        if (l && l->addr == addr) {
+            putchar('\n');
+            print_label_name(l);
+            puts(":");
+        }
+        uint32_t word = (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+        arm64_insn in;
+        arm64_decode(word, addr, &in);
+        printf("%9" PRIx64 "  %08x  ", addr, word);
+        if (in.operands[0])
+            printf("%-8s %s", in.mnemonic, in.operands);
+        else
+            fputs(in.mnemonic, stdout);
+        if (in.has_target)
+            print_symbolic(m, L, in.target);
+        if (in.comment[0])
+            printf("  ; %s", in.comment);
+        putchar('\n');
+    }
+}
+
+static int is_code(const struct section_64 *s)
+{
+    return (s->flags & (S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)) != 0;
+}
+
+static int cmd_disasm(const macho *m, int argc, char **argv)
+{
+    if (m->hdr->cputype != CPU_TYPE_ARM64) {
+        fprintf(stderr, "pry: disasm only decodes arm64 so far, this is %s\n",
+                macho_arch_name(m->hdr->cputype, m->hdr->cpusubtype));
+        return 1;
+    }
+    labels L = build_labels(m);
+    if (!L.v) {
+        fprintf(stderr, "pry: out of memory\n");
+        return 1;
+    }
+    uint64_t count = argc > 1 ? strtoull(argv[1], NULL, 0) : UINT64_MAX;
+    int rc = 0;
+
+    if (argc < 1) {
+        int first = 1;
+        for (int i = 1; i <= m->nsects; i++) {
+            const struct section_64 *s = m->sects[i];
+            if (!is_code(s))
+                continue;
+            printf("%s%.16s,%.16s:\n", first ? "" : "\n", s->segname, s->sectname);
+            disasm(m, &L, s->addr, s->addr + s->size, count);
+            first = 0;
+        }
+    } else {
+        uint64_t addr, size;
+        if (parse_target(m, argv[0], &addr, &size) < 0) {
+            rc = 1;
+        } else {
+            const struct section_64 *s = macho_section_at_vm(m, addr);
+            uint64_t end = s ? s->addr + s->size : UINT64_MAX;
+            if (size) {
+                end = addr + size;
+            } else if (argc < 2) { /* a symbol or address runs to the next label */
+                size_t i = 0;
+                while (i < L.n && L.v[i].addr <= addr)
+                    i++;
+                if (i < L.n && L.v[i].addr < end)
+                    end = L.v[i].addr;
+            }
+            disasm(m, &L, addr, end, count);
+        }
+    }
+    free(L.v);
+    return rc;
 }
 
 static const struct {
@@ -587,6 +773,7 @@ static const struct {
     {"funcs",    cmd_funcs,    "function starts, which survive stripping"},
     {"strings",  cmd_strings,  "C string literals with their addresses"},
     {"hex",      cmd_hex,      "hexdump: hex <file> <addr | symbol | seg,sect> [len]"},
+    {"disasm",   cmd_disasm,   "arm64 disassembly: disasm <file> [addr | symbol | seg,sect] [count]"},
 };
 
 static void usage(FILE *f)
